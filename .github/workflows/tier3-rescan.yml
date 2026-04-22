@@ -1,0 +1,175 @@
+name: AACP Tier 3 Scheduled Rescan
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runs every Monday at 6am UTC and after any manual trigger.
+# Scans all active Tier 3 engagements, computes deltas vs. prior scan,
+# and writes new violations to delta_alerts in Supabase.
+#
+# Setup:
+#   GitHub → Settings → Secrets → Actions → add the three secrets below.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'     # Every Monday 6:00 AM UTC
+  workflow_dispatch:          # Also manually triggerable from GitHub UI
+    inputs:
+      engagement_id:
+        description: 'Specific engagement UUID to scan (leave blank to scan all active Tier 3)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run (scan but do not write to database)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+  SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+  WCAG_LEVEL:           wcag22aa
+  SCAN_CONCURRENCY:     3
+  PAGE_TIMEOUT:         30000
+  NODE_ENV:             production
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  discover:
+  # Queries Supabase for all active Tier 3 engagements that need rescanning.
+  # Passes the list as a JSON matrix to the scan job.
+  # ───────────────────────────────────────────────────────────────────────────
+    runs-on: ubuntu-latest
+    outputs:
+      engagements: ${{ steps.query.outputs.engagements }}
+      count:       ${{ steps.query.outputs.count }}
+
+    steps:
+      - name: Query active Tier 3 engagements
+        id: query
+        run: |
+          if [ -n "${{ inputs.engagement_id }}" ]; then
+            # Manual override: scan a specific engagement
+            ENGAGEMENTS="[\"${{ inputs.engagement_id }}\"]"
+            COUNT=1
+          else:
+            # Query Supabase REST API for all active Tier 3 engagement IDs
+            RESPONSE=$(curl -s \
+              "${{ secrets.SUPABASE_URL }}/rest/v1/engagements?select=id&status=eq.complete&client_id=in.(select id from clients where tier=eq.tier3 and status=eq.active)" \
+              -H "apikey: ${{ secrets.SUPABASE_SERVICE_KEY }}" \
+              -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_KEY }}")
+
+            # Extract IDs and build JSON array
+            ENGAGEMENTS=$(echo $RESPONSE | node -e "
+              const data = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
+              console.log(JSON.stringify(data.map(r => r.id)));
+            " 2>/dev/null || echo '[]')
+            COUNT=$(echo $ENGAGEMENTS | node -e "
+              const a = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8'));
+              console.log(a.length);
+            " 2>/dev/null || echo '0')
+          fi
+
+          echo "engagements=$ENGAGEMENTS" >> $GITHUB_OUTPUT
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          echo "Discovered $COUNT engagement(s) to rescan"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  scan:
+  # Runs axe-core scan for each engagement in parallel (max 3 concurrent).
+  # ───────────────────────────────────────────────────────────────────────────
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        engagement: ${{ fromJson(needs.discover.outputs.engagements) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx puppeteer browsers install chrome
+
+      - name: Set Chrome path
+        run: |
+          CHROME=$(find ~/.cache/puppeteer -name "chrome" -type f 2>/dev/null | head -1)
+          echo "CHROME_PATH=$CHROME" >> $GITHUB_ENV
+          echo "Chrome found at: $CHROME"
+
+      - name: Run AACP scan — ${{ matrix.engagement }}
+        if: inputs.dry_run != true
+        run: node scanner/scanner.js scan ${{ matrix.engagement }}
+        timeout-minutes: 30
+
+      - name: Dry run preview — ${{ matrix.engagement }}
+        if: inputs.dry_run == true
+        run: |
+          echo "DRY RUN — would scan engagement: ${{ matrix.engagement }}"
+          echo "Set dry_run=false to execute"
+
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-log-${{ matrix.engagement }}
+          path: |
+            *.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ───────────────────────────────────────────────────────────────────────────
+  notify:
+  # After all scans complete, query for any new unresolved delta alerts
+  # and post a summary to Slack or email (optional).
+  # ───────────────────────────────────────────────────────────────────────────
+    needs: [discover, scan]
+    if: always() && needs.discover.outputs.count != '0'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Query new delta alerts
+        id: deltas
+        run: |
+          # Check for any unresolved critical delta alerts created in the last hour
+          RESPONSE=$(curl -s \
+            "${{ secrets.SUPABASE_URL }}/rest/v1/delta_alerts?select=rule_id,impact,url,clients(name)&resolved=eq.false&impact=eq.critical&created_at=gte.$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)" \
+            -H "apikey: ${{ secrets.SUPABASE_SERVICE_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_KEY }}" || echo "[]")
+
+          COUNT=$(echo $RESPONSE | node -e "
+            try { const a = JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')); console.log(a.length); }
+            catch(e) { console.log(0); }
+          " 2>/dev/null || echo "0")
+
+          echo "critical_delta_count=$COUNT" >> $GITHUB_OUTPUT
+          echo "New critical delta alerts: $COUNT"
+
+      - name: Post Slack alert for critical findings
+        if: steps.deltas.outputs.critical_delta_count != '0' && secrets.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-type: application/json" \
+            -d "{
+              \"text\": \"⚠ AACP Tier 3 Alert: ${{ steps.deltas.outputs.critical_delta_count }} new critical accessibility violation(s) detected in scheduled rescan. Review delta alerts in the AACP dashboard.\",
+              \"username\": \"AACP Scanner\",
+              \"icon_emoji\": \":accessibility:\"
+            }"
+
+      - name: Summary
+        run: |
+          echo "## AACP Tier 3 Rescan Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- Engagements scanned: ${{ needs.discover.outputs.count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- New critical delta alerts: ${{ steps.deltas.outputs.critical_delta_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Scan time: $(date -u)" >> $GITHUB_STEP_SUMMARY

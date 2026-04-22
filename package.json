@@ -1,0 +1,23 @@
+{
+  "name": "aacp-scanner",
+  "version": "1.0.0",
+  "description": "Alphapointe Accessibility Certification Program — axe-core scanner with Supabase",
+  "main": "scanner/scanner.js",
+  "scripts": {
+    "scan":   "node scanner/scanner.js scan",
+    "quick":  "node scanner/scanner.js quick",
+    "deltas": "node scanner/scanner.js deltas",
+    "help":   "node scanner/scanner.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "axe-core": "^4.10.3",
+    "dotenv": "^16.4.7",
+    "puppeteer-core": "^22.11.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "keywords": ["accessibility", "wcag", "axe-core", "supabase", "alphapointe", "aacp"]
+}
